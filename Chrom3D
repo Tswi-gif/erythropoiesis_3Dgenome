@@ -1,0 +1,502 @@
+# Chrom3D 3D Genome Structure Modeling Workflow
+
+## Overview
+
+This document outlines the complete workflow for reconstructing 3D genome structures using Chrom3D, integrating Hi-C interaction data with chromatin domain annotations and LAD (Lamin-Associated Domain) information. The pipeline processes Hi-C data through domain identification, interaction filtering, statistical analysis, and finally generates ensemble 3D structural models.
+
+## Required Tools
+
+### Core Tools
+
+- **juicer_tools**: Domain identification and Hi-C data processing
+- **Chrom3D**: 3D genome structure modeling
+- **NCHG**: Statistical analysis of chromatin interactions
+- **bedtools**: Genomic interval operations
+- **Python** (with numpy, matplotlib): Data processing and visualization
+
+### Auxiliary Scripts
+
+- `arrowhead_to_domains.sh`: Converts Arrowhead output to domain format
+- `make_NCHG_input.sh`: Prepares input files for NCHG analysis
+- `make_gtrack.sh`: Generates gtrack files for Chrom3D
+- `make_gtrack_incl_lad.sh`: Incorporates LAD information into gtrack files
+- `interchr_NCHG_input_auto.sh`: Prepares inter-chromosomal interaction data
+- `add_inter_chrom_beads.sh`: Adds inter-chromosomal beads to gtrack
+- `make_diploid_gtrack.py`: Creates diploid gtrack files
+- `NCHG_fdr_oddratio_calc.py`: Calculates FDR and odds ratios for NCHG results
+- `process_multiple_cmm.py`: Processes multiple Chrom3D models and generates visualizations
+
+---
+
+## Processing Steps
+
+### Step 1: Domain Identification Using Arrowhead
+
+**Tool**: `juicer_tools arrowhead`
+
+**Purpose**: Identify chromatin domains (loops/contact domains) from Hi-C data
+
+**Key Parameters**:
+
+- `-c`: Chromosomes to process (comma-separated list)
+- `-m`: Minimum domain size (in bins)
+- `-r`: Resolution (in base pairs)
+- `-k`: Normalization method (KR recommended)
+
+**Example Command**:
+java -jar juicer_tools.2.20.00.jar arrowhead \
+    -c chr1,chr2,chr3,chr4,chr5,chr6,chr7,chr8,chr9,chr10,chr11,chr12,chr13,chr14,chr15,chr16,chr17,chr18,chr19,chr20,chr21,chr22,chrX \
+    -m 2000 \
+    -r 50000 \
+    -k KR \
+    ${sample}_cis.allValidPairs.hic \
+    ${sample}_Arrowhead_domainlist/**Output**: 
+- `50000_blocks.bedpe`: Domain boundaries in BEDPE format
+
+**Notes**: 
+- Arrowhead identifies domains at a specific resolution (typically 50kb)
+- KR normalization is recommended for better signal-to-noise ratio
+- Minimum domain size parameter filters out small, potentially spurious domains
+
+---
+
+### Step 2: Convert Arrowhead Output to Domain Format
+
+**Tool**: `arrowhead_to_domains.sh`
+
+**Purpose**: Transform Arrowhead BEDPE output into chromosome-specific domain files
+
+**Input**: 
+- Arrowhead BEDPE file (`50000_blocks.bedpe`)
+- Chromosome size file (e.g., `hg38_chromtin.sizes`)
+
+**Output**: 
+- Per-chromosome domain files (`50000_blocks.chr*.domains`)
+
+**Example Command**:
+bash arrowhead_to_domains.sh \
+    ${sample}_Arrowhead_domainlist/50000_blocks.bedpe \
+    hg38_chromtin.sizes---
+
+### Step 3: Prepare Intra-chromosomal Interaction Data
+
+**Tool**: `make_NCHG_input.sh`
+
+**Purpose**: Generate BEDPE files containing intra-chromosomal interactions within identified domains
+
+**Process**: 
+- For each chromosome (1-22, X), extracts interactions from the Hi-C matrix
+- Filters interactions to those within Arrowhead-identified domains
+- Outputs domain-specific interaction files
+
+**Example Command**:
+for i in {1..22} X; do
+    bash make_NCHG_input.sh \
+        ${sample}_Arrowhead_domainlist/50000_blocks.chr${i}.domains \
+        ${sample}_matrix_50kb.chr${i}.txt \
+        chr${i} > ${sample}_chr${i}_50kb.domains.RAW.bedpe
+done**Output**: 
+- Per-chromosome BEDPE files (`*_chr*_50kb.domains.RAW.bedpe`)
+
+**Notes**: 
+- Requires pre-computed Hi-C interaction matrices at 50kb resolution
+- Each domain file contains only interactions within that chromosome's domains
+
+---
+
+### Step 4: Merge Chromosome-Specific Domain Files
+
+**Purpose**: Combine all chromosome-specific domain interaction files into a single file
+
+**Example Command**:
+cat ${sample}_chr*_50kb.domains.RAW.bedpe > ${sample}_50kb.domains.RAW.bedpe**Output**: 
+- Merged BEDPE file containing all intra-chromosomal domain interactions
+
+---
+
+### Step 5: Remove Centromeric Regions
+
+**Tool**: `pairToBed` (from bedtools), `curl`, `gunzip`
+
+**Purpose**: Filter out interactions involving centromeric regions, which can introduce artifacts
+
+**Process**: 
+- Downloads centromere annotation from UCSC
+- Removes interactions overlapping centromeric regions
+
+**Example Command**:
+curl -s "http://hgdownload.cse.ucsc.edu/goldenPath/hg38/database/cytoBand.txt.gz" | \
+    gunzip -c | \
+    grep acen | \
+    pairToBed -a ${sample}_50kb.domains.RAW.bedpe -b stdin -type neither > \
+    ${sample}_50kb.domains.RAW.no_cen.bedpe**Output**: 
+- Filtered BEDPE file without centromeric interactions (`*_no_cen.bedpe`)
+
+**Notes**: 
+- Centromeres often show artificially high interaction frequencies
+- Removing them improves downstream statistical analysis
+
+---
+
+### Step 6: Statistical Analysis of Intra-chromosomal Interactions
+
+**Tool**: `NCHG`
+
+**Purpose**: Perform statistical analysis to identify significant chromatin interactions
+
+**Key Parameters**:
+
+- `-m`: Resolution (in base pairs)
+- `-p`: Input BEDPE file
+
+**Example Command**:
+NCHG -m 50000 -p ${sample}_50kb.domains.RAW.no_cen.bedpe > \
+    ${sample}_50kb.domains.RAW.no_cen.NCHG.out**Output**: 
+- NCHG output file containing interaction statistics
+
+**Notes**: 
+- NCHG (Normalized Contact Frequency and Hierarchical Grouping) identifies statistically significant interactions
+- Accounts for distance-dependent contact probability
+
+---
+
+### Step 7: Calculate FDR and Filter Significant Interactions
+
+**Tool**: `NCHG_fdr_oddratio_calc.py`
+
+**Purpose**: Apply multiple testing correction and filter interactions by significance
+
+**Key Parameters**:
+
+- `fdr_bh`: Benjamini-Hochberg FDR correction method
+- `2`: Column index for p-values
+- `0.01`: FDR threshold
+
+**Example Command**:
+python NCHG_fdr_oddratio_calc.py \
+    ${sample}_50kb.domains.RAW.no_cen.NCHG.out \
+    fdr_bh 2 0.01 > \
+    ${sample}_50kb.domain.RAW.no_cen.NCHG.sig
+**Output**: 
+- Filtered file containing only significant interactions (`*_sig`)
+
+**Notes**: 
+- FDR correction controls false discovery rate across multiple tests
+- Typical threshold of 0.01 balances sensitivity and specificity
+
+---
+
+### Step 8: Generate Gtrack Files with Domain Information
+
+**Tool**: `make_gtrack.sh`
+
+**Purpose**: Create gtrack format files required by Chrom3D, incorporating domain boundaries
+
+**Input**: 
+- Significant interaction file (`*_sig`)
+- Domain boundaries file (`50000_blocks.domains`)
+
+**Output**: 
+- Gtrack file (`*_intra_chromosome.gtrack`)
+
+**Example Command**:
+bash make_gtrack.sh \
+    ${sample}_50kb.domain.RAW.no_cen.NCHG.sig \
+    50000_blocks.domains \
+    ${sample}_50kb_intra_chromosome.gtrack**Notes**: 
+- Gtrack format specifies genomic regions (beads) and their interactions
+- Each bead represents a domain or genomic bin
+
+---
+
+### Step 9: Incorporate LAD Information
+
+**Tool**: `make_gtrack_incl_lad.sh`
+
+**Purpose**: Add Lamin-Associated Domain (LAD) annotations to gtrack files
+
+**Rationale**: 
+- LADs are preferentially located at the nuclear periphery
+- Including LAD information improves 3D model accuracy
+
+**Input**: 
+- Gtrack file from Step 8
+- LAD peak file (BED format)
+
+**Example Command**:
+bash make_gtrack_incl_lad.sh \
+    ${sample}_50kb_intra_chromosome.gtrack \
+    ${sample}-B-1_peaks.bed \
+    ${sample}_50kb_intra_chromosome_w_LADs.gtrack**Output**: 
+- Gtrack file with LAD annotations (`*_w_LADs.gtrack`)
+
+**Notes**: 
+- LAD files are typically generated from LaminB1 ChIP-seq data
+- LADs constrain bead positions in the 3D model
+
+---
+
+### Step 10: Prepare Inter-chromosomal Interaction Data
+
+**Tool**: `interchr_NCHG_input_auto.sh`
+
+**Purpose**: Extract and prepare inter-chromosomal interactions for analysis
+
+**Key Parameters**:
+
+- Chromosome size file
+- Blacklist file (e.g., `hg38-blacklist.bed`)
+- Resolution (e.g., `1mb`)
+
+**Example Command**:
+bash interchr_NCHG_input_auto.sh \
+    hg38_chromtin.sizes \
+    hg38-blacklist.bed \
+    1mb \
+    ${sample} > ${sample}_1mb_inter.bedpe**Output**: 
+- Inter-chromosomal interaction BEDPE file (`*_inter.bedpe`)
+
+**Notes**: 
+- Inter-chromosomal analysis typically uses lower resolution (1Mb) due to lower interaction frequencies
+- Blacklist regions (e.g., repetitive elements) are excluded
+
+---
+
+### Step 11: Analyze Inter-chromosomal Interactions
+
+**Tool**: `NCHG` (with `-i` flag)
+
+**Purpose**: Identify significant inter-chromosomal interactions
+
+**Example Command**:sh
+NCHG -i -p ${sample}_1mb_inter.bedpe > ${sample}_1mb_inter_chr.NCHG.out
+
+python NCHG_fdr_oddratio_calc.py \
+    ${sample}_1mb_inter_chr.NCHG.out \
+    fdr_bh 2 0.01 > ${sample}_1mb_inter_chr.NCHG.sig**Output**: 
+- Significant inter-chromosomal interactions (`*_inter_chr.NCHG.sig`)
+
+---
+
+### Step 12: Combine Intra- and Inter-chromosomal Data
+
+**Tool**: `add_inter_chrom_beads.sh`
+
+**Purpose**: Merge intra-chromosomal gtrack with inter-chromosomal interaction data
+
+**Example Command**:
+bash add_inter_chrom_beads.sh \
+    ${sample}_50kb_intra_chromosome_w_LADs.gtrack \
+    ${sample}_1mb_inter_chr.NCHG.sig \
+    ${sample}_inter_intra_chr_w_LADs.gtrack**Output**: 
+- Combined gtrack file with both intra- and inter-chromosomal interactions
+
+---
+
+### Step 13: Create Diploid Gtrack
+
+**Tool**: `make_diploid_gtrack.py`
+
+**Purpose**: Generate diploid representation accounting for both homologous chromosomes
+
+**Rationale**: 
+- Diploid cells contain two copies of each chromosome
+- Modeling both alleles improves structural accuracy
+
+**Example Command**:
+python make_diploid_gtrack.py \
+    ${sample}_inter_intra_chr_w_LADs.gtrack > \
+    ${sample}_inter_intra_chr_w_LADs.diploid.gtrack**Output**: 
+- Diploid gtrack file (`*_diploid.gtrack`)
+
+---
+
+### Step 14: Generate 3D Structures with Chrom3D
+
+**Tool**: `Chrom3D`
+
+**Purpose**: Reconstruct 3D genome structures from gtrack files
+
+**Key Parameters**:
+
+- `-y`: Interaction strength scaling factor (typically 0.15)
+- `-r`: Bead radius (typically 5.0)
+- `-n`: Number of optimization steps (typically 2,000,000)
+- `-s`: Random seed (for reproducibility)
+- `--nucleus`: Constrain beads within nuclear boundary
+- `-o`: Output CMM file
+
+**Example Command** (single structure):
+Chrom3D \
+    -y 0.15 \
+    -r 5.0 \
+    -n 2000000 \
+    -o ${sample}_structure.cmm \
+    ${sample}_inter_intra_chr_w_LADs.diploid.gtrack**Example Command** (ensemble generation with parallel processing):ash
+# Generate multiple structures with different random seeds
+for i in $(seq 1 403); do
+    Chrom3D \
+        -y 0.15 \
+        -r 5.0 \
+        -n 2000000 \
+        -s ${RANDOM} \
+        --nucleus \
+        -o ${sample}_400structure/${sample}_structure_${i}.cmm \
+        ${sample}_inter_intra_chr_w_LADs.diploid.gtrack &
+done
+wait**Output**: 
+- CMM (Chromosome Model) files containing 3D coordinates for each bead
+
+**Notes**: 
+- Multiple structures (ensemble) capture structural variability
+- Random seeds ensure independent sampling of conformational space
+- Nuclear constraint prevents unrealistic bead positions
+
+---
+
+### Step 15: Process and Visualize Ensemble Structures
+
+**Tool**: `process_multiple_cmm.py`
+
+**Purpose**: Analyze multiple Chrom3D models and generate visualizations
+
+**Key Features**:
+
+- Parses CMM files to extract 3D coordinates
+- Calculates radial distances from nuclear center
+- Averages positions across ensemble
+- Generates heatmaps showing radial positioning
+- Analyzes LAD positioning relative to nuclear periphery
+
+**Example Command**:
+python process_multiple_cmm.py \
+    ./sample1_400structure,./sample2_400structure,./sample3_400structure \
+    ./LADs.bed \
+    5.0**Key Parameters**:
+
+- Input directories (comma-separated)
+- LAD BED file
+- Nuclear radius (optional; calculated if not provided)
+
+**Output**: 
+- Averaged radial position heatmaps (PDF)
+- LAD distance boxplots
+- Statistical summaries
+- BED files with distance annotations
+
+**Visualization Features**:
+
+- **Heatmaps**: Show average radial position of each genomic region
+  - Color scale: nuclear center (blue) to periphery (red)
+  - LAD regions highlighted with black borders
+  - Chromosomes arranged vertically
+
+- **Boxplots**: Compare LAD positioning across samples
+  - Shows distribution of LAD distances
+  - Includes sample-specific statistics
+
+**Notes**: 
+- Ensemble averaging reduces noise and highlights consistent features
+- Radial distance analysis reveals nuclear organization patterns
+- LAD positioning validates model accuracy (LADs should be peripheral)
+
+---
+
+## File Format Descriptions
+
+### Gtrack Format
+
+Chrom3D input format specifying:
+- Genomic regions (beads) with coordinates
+- Interaction constraints between beads
+- LAD annotations (peripheral constraints)
+
+### CMM Format
+
+Chromosome Model format containing:
+- 3D coordinates (x, y, z) for each bead
+- Chromosome and allele information
+- Bead identifiers with genomic coordinates
+
+### BEDPE Format
+
+Paired-end BED format for interactions:
+- Two genomic intervals per line
+- Interaction strength or significance
+- Used for NCHG input
+
+---
+
+## Key Considerations
+
+### Resolution Selection
+
+- **Intra-chromosomal**: Typically 50kb for domain-level analysis
+- **Inter-chromosomal**: Typically 1Mb due to lower interaction frequencies
+- Higher resolution increases computational cost but improves detail
+
+### Statistical Thresholds
+
+- **FDR threshold**: 0.01 balances sensitivity and specificity
+- **Domain size**: Minimum size filters spurious small domains
+- **Interaction strength**: NCHG accounts for distance-dependent contact probability
+
+### Model Parameters
+
+- **Interaction strength (-y)**: Controls how strongly interactions pull beads together
+  - Lower values (0.1-0.2) produce more compact structures
+  - Higher values allow more expansion
+
+- **Bead radius (-r)**: Physical size of genomic segments
+  - Typically 5.0 for 50kb resolution
+  - Scales with resolution
+
+- **Optimization steps (-n)**: Number of Monte Carlo steps
+  - More steps improve convergence but increase runtime
+  - 2,000,000 steps typically sufficient
+
+### Ensemble Size
+
+- **Recommended**: 200-500 structures per sample
+- Larger ensembles better capture structural variability
+- Computational cost scales linearly with ensemble size
+
+### Quality Control
+
+- **LAD positioning**: LADs should be preferentially peripheral
+- **Radial distance distribution**: Should show clear center-periphery gradient
+- **Convergence**: Check that multiple runs produce similar average structures
+
+---
+
+## Computational Requirements
+
+### Memory
+
+- **Per sample**: 8-16 GB RAM recommended
+- **Ensemble processing**: Scales with number of structures
+
+### Storage
+
+- **Intermediate files**: ~10-50 GB per sample
+- **CMM files**: ~1-5 MB per structure
+- **Ensemble of 400 structures**: ~400 MB - 2 GB per sample
+
+### Runtime
+
+- **Domain identification**: 1-4 hours per sample
+- **NCHG analysis**: 2-8 hours per sample
+- **Single Chrom3D structure**: 10-60 minutes
+- **Ensemble of 400 structures**: 3-10 days (with parallelization)
+
+---
+
+## References
+
+- **Chrom3D**: Paulsen et al. (2017) Chrom3D: three-dimensional genome modeling from Hi-C and nuclear lamin-genome contacts. *Bioinformatics*, 33(19):3038-3044. doi: 10.1093/bioinformatics/btx405
+
+- **Juicer Tools**: Durand et al. (2016) Juicer provides a one-click system for analyzing loop-resolution Hi-C experiments. *Cell Systems*, 3(1):95-98. doi: 10.1016/j.cels.2016.07.002
+
+- **NCHG**: Paulsen et al. (2015) Chrom3D: three-dimensional genome modeling from Hi-C and nuclear lamin-genome contacts. *Genome Biology*, 16:205. doi: 10.1186/s13059-015-0766-2
+
+- **Arrowhead Algorithm**: Rao et al. (2014) A 3D map of the human genome at kilobase resolution reveals principles of chromatin looping. *Cell*, 159(7):1665-1680. doi: 10.1016/j.cell.2014.11.021

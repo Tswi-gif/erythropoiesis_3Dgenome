@@ -1,0 +1,833 @@
+# ============================================================================
+# RNA-seq Differential Expression Analysis Pipeline
+# Requirements:
+#   - DESeq2
+#   - pheatmap
+#   - ggplot2
+#   - ggrepel
+#   - org.Hs.eg.db
+#   - clusterProfiler
+#   - ComplexHeatmap
+#   - RColorBrewer
+#   - plotly
+#   - htmlwidgets
+#   - VennDiagram
+#   - dplyr
+#   - tidyr
+#   - ggpubr
+#
+# Usage:
+#   source("rnaseq_deseq2_analysis.R")
+#   results <- run_deseq2_analysis(
+#     count_file = "gene_count_matrix.csv",
+#     group_info = c(rep("control", 3), rep("treatment", 3)),
+#     output_dir = "results"
+#   )
+#
+# ============================================================================
+
+# ============================================================================
+# 1. Load Required Libraries
+# ============================================================================
+
+required_packages <- c(
+  "DESeq2", "pheatmap", "ggplot2", "ggrepel", "org.Hs.eg.db",
+  "clusterProfiler", "ComplexHeatmap", "RColorBrewer", "plotly",
+  "htmlwidgets", "VennDiagram", "dplyr", "tidyr", "ggpubr"
+)
+
+install_if_missing <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (pkg %in% c("org.Hs.eg.db", "clusterProfiler")) {
+      if (!requireNamespace("BiocManager", quietly = TRUE)) {
+        install.packages("BiocManager")
+      }
+      BiocManager::install(pkg)
+    } else {
+      install.packages(pkg)
+    }
+  }
+}
+
+for (pkg in required_packages) {
+  install_if_missing(pkg)
+  library(pkg, character.only = TRUE)
+}
+
+# ============================================================================
+# 2. Data Loading and Preprocessing Functions
+# ============================================================================
+
+#' Read count matrix from CSV file
+#' @param count_file Path to count matrix CSV file
+#' @param gene_id_col Column name for gene IDs (default: "gene_id")
+#' @param min_mean_count Minimum mean count to filter genes (default: 1)
+#' @return Count matrix
+read_count_matrix <- function(count_file, gene_id_col = "gene_id", min_mean_count = 1) {
+  cat("Reading count matrix from:", count_file, "\n")
+  
+  count_data <- read.csv(count_file, row.names = gene_id_col, check.names = FALSE)
+  
+  # Convert to numeric matrix
+  count_matrix <- apply(count_data, 2, as.numeric)
+  rownames(count_matrix) <- rownames(count_data)
+  
+  # Filter low expression genes
+  if (min_mean_count > 0) {
+    keep <- rowMeans(count_matrix) > min_mean_count
+    count_matrix <- count_matrix[keep, , drop = FALSE]
+    cat("Filtered to", nrow(count_matrix), "genes (mean count >", min_mean_count, ")\n")
+  }
+  
+  cat("Count matrix dimensions:", nrow(count_matrix), "genes x", ncol(count_matrix), "samples\n")
+  return(count_matrix)
+}
+
+#' Convert ENSEMBL IDs to gene symbols
+#' @param gene_ids Vector of ENSEMBL IDs
+#' @param from_type Input ID type (default: "ENSEMBL")
+#' @param to_type Output ID type (default: "SYMBOL")
+#' @return Data frame with converted IDs
+convert_gene_ids <- function(gene_ids, from_type = "ENSEMBL", to_type = "SYMBOL") {
+  cat("Converting", length(gene_ids), "gene IDs from", from_type, "to", to_type, "\n")
+  
+  result <- bitr(
+    gene_ids,
+    fromType = from_type,
+    toType = to_type,
+    OrgDb = org.Hs.eg.db,
+    drop = TRUE
+  )
+  
+  # Handle duplicates
+  if (any(duplicated(result[[from_type]]))) {
+    cat("Warning: Duplicate mappings found, keeping first match\n")
+    result <- result[!duplicated(result[[from_type]]), ]
+  }
+  
+  cat("Successfully converted", nrow(result), "genes\n")
+  return(result)
+}
+
+# ============================================================================
+# 3. DESeq2 Analysis Functions
+# ============================================================================
+
+#' Perform DESeq2 differential expression analysis
+#' @param count_matrix Count matrix (genes x samples)
+#' @param col_data Data frame with sample information
+#' @param design_formula Design formula (default: ~ condition)
+#' @param fit_type Fitting type (default: "mean")
+#' @return DESeqDataSet object
+run_deseq2 <- function(count_matrix, col_data, design_formula = ~ condition, 
+                       fit_type = "mean") {
+  cat("Running DESeq2 analysis...\n")
+  
+  # Round counts
+  count_matrix <- round(count_matrix)
+  
+  # Create DESeqDataSet
+  dds <- DESeqDataSetFromMatrix(
+    countData = count_matrix,
+    colData = col_data,
+    design = design_formula
+  )
+  
+  # Run DESeq
+  dds <- DESeq(dds, fitType = fit_type, minReplicatesForReplace = 7, parallel = FALSE)
+  
+  cat("DESeq2 analysis completed\n")
+  return(dds)
+}
+
+#' Extract differential expression results
+#' @param dds DESeqDataSet object
+#' @param contrast Vector of contrast: c("condition", "treatment", "control")
+#' @param alpha FDR threshold (default: 0.05)
+#' @param lfc_threshold Log2 fold change threshold (default: 1)
+#' @return Results data frame
+extract_de_genes <- function(dds, contrast = NULL, alpha = 0.05, lfc_threshold = 1) {
+  cat("Extracting differential expression results...\n")
+  
+  if (is.null(contrast)) {
+    res <- results(dds)
+  } else {
+    res <- results(dds, contrast = contrast)
+  }
+  
+  # Convert to data frame
+  res_df <- as.data.frame(res, stringsAsFactors = FALSE)
+  
+  # Sort by pvalue and log2FoldChange
+  res_df <- res_df[order(res_df$pvalue, res_df$log2FoldChange, 
+                         decreasing = c(FALSE, TRUE)), ]
+  
+  # Classify genes
+  res_df$regulation <- "NS"
+  res_df$regulation[res_df$log2FoldChange >= lfc_threshold & res_df$pvalue < alpha] <- "Up"
+  res_df$regulation[res_df$log2FoldChange <= -lfc_threshold & res_df$pvalue < alpha] <- "Down"
+  
+  # Summary
+  cat("Differential expression summary:\n")
+  cat("  Up-regulated:", sum(res_df$regulation == "Up"), "\n")
+  cat("  Down-regulated:", sum(res_df$regulation == "Down"), "\n")
+  cat("  Not significant:", sum(res_df$regulation == "NS"), "\n")
+  
+  return(res_df)
+}
+
+# ============================================================================
+# 4. Visualization Functions
+# ============================================================================
+
+#' Create PCA plot (2D or 3D)
+#' @param dds DESeqDataSet object
+#' @param output_file Output file path (optional)
+#' @param dims Number of dimensions (2 or 3, default: 3)
+#' @param color_by Column name in colData for coloring (default: "condition")
+#' @return Plot object
+create_pca_plot <- function(dds, output_file = NULL, dims = 3, color_by = "condition") {
+  cat("Creating PCA plot...\n")
+  
+  # Perform rlog transformation
+  rld <- rlog(dds, blind = TRUE)
+  
+  # Extract expression matrix
+  expr <- assay(rld)
+  expr_t <- t(expr)
+  
+  # Calculate PCA
+  pca <- prcomp(expr_t, scale. = TRUE)
+  
+  # Extract principal components
+  pca_df <- as.data.frame(pca$x[, 1:min(dims, ncol(pca$x))])
+  pca_df$group <- colData(rld)[[color_by]]
+  pca_df$sample <- rownames(pca_df)
+  
+  # Calculate variance explained
+  percent_var <- round(100 * (pca$sdev^2 / sum(pca$sdev^2)), 1)
+  
+  if (dims == 3) {
+    # 3D PCA plot
+    fig <- plot_ly(
+      pca_df,
+      x = ~PC1, y = ~PC2, z = ~PC3,
+      color = ~group,
+      text = ~sample,
+      colors = "Set1",
+      type = "scatter3d",
+      mode = "markers",
+      marker = list(size = 8)
+    )
+    
+    fig <- fig %>% layout(
+      scene = list(
+        xaxis = list(title = paste0("PC1 (", percent_var[1], "%)"),
+                    titlefont = list(size = 18),
+                    tickfont = list(size = 16)),
+        yaxis = list(title = paste0("PC2 (", percent_var[2], "%)"),
+                    titlefont = list(size = 18),
+                    tickfont = list(size = 16)),
+        zaxis = list(title = paste0("PC3 (", percent_var[3], "%)"),
+                    titlefont = list(size = 18),
+                    tickfont = list(size = 16))
+      )
+    )
+    
+    if (!is.null(output_file)) {
+      saveWidget(fig, output_file)
+      cat("3D PCA plot saved to:", output_file, "\n")
+    }
+    
+    return(fig)
+  } else {
+    # 2D PCA plot
+    p <- ggplot(pca_df, aes(x = PC1, y = PC2, color = group, label = sample)) +
+      geom_point(size = 3) +
+      geom_text_repel() +
+      scale_color_brewer(palette = "Set1") +
+      labs(
+        x = paste0("PC1 (", percent_var[1], "%)"),
+        y = paste0("PC2 (", percent_var[2], "%)")
+      ) +
+      theme_bw() +
+      theme(legend.position = "right")
+    
+    if (!is.null(output_file)) {
+      ggsave(output_file, p, width = 8, height = 6)
+      cat("2D PCA plot saved to:", output_file, "\n")
+    }
+    
+    return(p)
+  }
+}
+
+#' Create volcano plot
+#' @param res_df Results data frame from DESeq2
+#' @param output_file Output file path (optional)
+#' @param lfc_threshold Log2 fold change threshold (default: 1)
+#' @param pvalue_threshold P-value threshold (default: 0.05)
+#' @param label_genes Vector of gene names to label (optional)
+#' @return ggplot object
+create_volcano_plot <- function(res_df, output_file = NULL, 
+                                lfc_threshold = 1, pvalue_threshold = 0.05,
+                                label_genes = NULL) {
+  cat("Creating volcano plot...\n")
+  
+  # Prepare data
+  genes <- res_df
+  genes$color <- ifelse(
+    genes$padj < pvalue_threshold & abs(genes$log2FoldChange) >= lfc_threshold,
+    ifelse(genes$log2FoldChange > lfc_threshold, "red", "blue"),
+    "gray"
+  )
+  genes$gene_name <- rownames(genes)
+  
+  # Handle zero p-values
+  genes$padj_new <- genes$padj
+  zero_idx <- which(genes$padj == 0)
+  if (length(zero_idx) > 0) {
+    genes$padj_new[zero_idx] <- 1.195064e-303 / (10^(seq_along(zero_idx) - 1))
+  }
+  
+  # Create plot
+  p <- ggplot(genes, aes(log2FoldChange, -log10(padj_new), col = color)) +
+    geom_point() +
+    theme_bw() +
+    scale_color_manual(values = c(red = "red", gray = "gray", blue = "blue")) +
+    labs(x = "log2 (fold change)", y = "-log10 (FDR)") +
+    geom_hline(yintercept = -log10(pvalue_threshold), lty = 4, col = "grey", lwd = 0.6) +
+    geom_vline(xintercept = c(-lfc_threshold, lfc_threshold), lty = 4, col = "grey", lwd = 0.6) +
+    theme(
+      legend.position = "none",
+      panel.grid = element_blank(),
+      axis.title = element_text(size = 16),
+      axis.text = element_text(size = 14)
+    )
+  
+  # Add labels
+  if (!is.null(label_genes)) {
+    genes_to_label <- genes[genes$gene_name %in% label_genes & genes$color != "gray", ]
+    if (nrow(genes_to_label) > 0) {
+      p <- p + geom_text_repel(
+        data = genes_to_label,
+        aes(label = gene_name),
+        box.padding = 0.35,
+        point.padding = 0.5,
+        size = 4,
+        color = "black"
+      )
+    }
+  } else {
+    # Label significant genes
+    p <- p + geom_text_repel(
+      data = subset(genes, color %in% c("red", "blue")),
+      aes(label = gene_name),
+      box.padding = 0.35,
+      point.padding = 0.5,
+      size = 4,
+      color = "black",
+      max.overlaps = 20
+    )
+  }
+  
+  if (!is.null(output_file)) {
+    ggsave(output_file, p, width = 8, height = 6)
+    cat("Volcano plot saved to:", output_file, "\n")
+  }
+  
+  return(p)
+}
+
+#' Create expression heatmap
+#' @param count_matrix Count matrix
+#' @param genes Vector of gene names to include
+#' @param samples Vector of sample names to include (optional)
+#' @param output_file Output file path (optional)
+#' @param scale Whether to scale rows (default: TRUE)
+#' @param cluster_rows Whether to cluster rows (default: TRUE)
+#' @param cluster_cols Whether to cluster columns (default: FALSE)
+#' @param label_genes Vector of genes to label (optional)
+#' @return Heatmap object
+create_expression_heatmap <- function(count_matrix, genes, samples = NULL,
+                                     output_file = NULL, scale = TRUE,
+                                     cluster_rows = TRUE, cluster_cols = FALSE,
+                                     label_genes = NULL) {
+  cat("Creating expression heatmap...\n")
+  
+  # Filter genes
+  genes <- intersect(genes, rownames(count_matrix))
+  if (length(genes) == 0) {
+    stop("No matching genes found in count matrix")
+  }
+  
+  # Filter samples
+  if (!is.null(samples)) {
+    samples <- intersect(samples, colnames(count_matrix))
+    if (length(samples) == 0) {
+      stop("No matching samples found in count matrix")
+    }
+    heatmap_data <- count_matrix[genes, samples, drop = FALSE]
+  } else {
+    heatmap_data <- count_matrix[genes, , drop = FALSE]
+  }
+  
+  # Scale if requested
+  if (scale) {
+    heatmap_data <- t(scale(t(heatmap_data)))
+  }
+  
+  # Create heatmap
+  p <- Heatmap(
+    heatmap_data,
+    name = ifelse(scale, "Z-score", "Expression"),
+    row_names_gp = gpar(fontsize = 10),
+    cluster_rows = cluster_rows,
+    cluster_columns = cluster_cols,
+    show_column_names = TRUE,
+    show_row_names = FALSE,
+    col = rev(brewer.pal(n = 11, name = "RdYlBu"))
+  )
+  
+  # Add gene labels if specified
+  if (!is.null(label_genes)) {
+    label_genes <- intersect(label_genes, rownames(heatmap_data))
+    if (length(label_genes) > 0) {
+      label_idx <- which(rownames(heatmap_data) %in% label_genes)
+      p <- p + rowAnnotation(
+        link = anno_mark(
+          at = label_idx,
+          labels = rownames(heatmap_data)[label_idx],
+          labels_gp = gpar(fontsize = 10)
+        )
+      )
+    }
+  }
+  
+  if (!is.null(output_file)) {
+    pdf(output_file, width = 8, height = 10)
+    draw(p)
+    dev.off()
+    cat("Heatmap saved to:", output_file, "\n")
+  }
+  
+  return(p)
+}
+
+# ============================================================================
+# 5. Enrichment Analysis Functions
+# ============================================================================
+
+#' Perform GO and KEGG enrichment analysis
+#' @param genes Vector of gene symbols or ENTREZ IDs
+#' @param output_dir Output directory (optional)
+#' @param from_type Input ID type (default: "SYMBOL")
+#' @param width Plot width (default: 6)
+#' @param height Plot height (default: 4)
+#' @param show_category Number of categories to show (default: 10)
+#' @param font_size Font size (default: 8)
+#' @param go_pvalue GO p-value cutoff (default: 0.05)
+#' @param kegg_pvalue KEGG p-value cutoff (default: 0.01)
+#' @return List of enrichment results
+perform_enrichment_analysis <- function(genes, output_dir = NULL,
+                                      from_type = "SYMBOL",
+                                      width = 6, height = 4,
+                                      show_category = 10,
+                                      font_size = 8,
+                                      go_pvalue = 0.05,
+                                      kegg_pvalue = 0.01) {
+  cat("Performing enrichment analysis...\n")
+  
+  # Create output directory
+  if (is.null(output_dir)) {
+    output_dir <- format(Sys.time(), "enrichment_%Y%m%d_%H%M%S")
+  }
+  dir.create(output_dir, showWarnings = FALSE)
+  
+  # Convert gene IDs
+  if (from_type != "ENTREZID") {
+    gene_id_conversion <- bitr(
+      genes,
+      fromType = from_type,
+      toType = "ENTREZID",
+      OrgDb = org.Hs.eg.db,
+      drop = TRUE
+    )
+    entrez_ids <- gene_id_conversion$ENTREZID
+    
+    # Save conversion table
+    write.csv(gene_id_conversion,
+              file.path(output_dir, "gene_id_conversion.csv"),
+              row.names = FALSE)
+  } else {
+    entrez_ids <- genes
+  }
+  
+  cat("Analyzing", length(entrez_ids), "genes\n")
+  
+  # Perform GO enrichment
+  enrichment_results <- list()
+  
+  for (ont in c("BP", "CC", "MF")) {
+    cat("  GO", ont, "enrichment...\n")
+    enrichment_results[[paste0("GO_", ont)]] <- enrichGO(
+      entrez_ids,
+      OrgDb = org.Hs.eg.db,
+      ont = ont,
+      pvalueCutoff = go_pvalue,
+      pAdjustMethod = "BH"
+    )
+    
+    # Save results
+    if (nrow(as.data.frame(enrichment_results[[paste0("GO_", ont)]])) > 0) {
+      write.csv(
+        as.data.frame(enrichment_results[[paste0("GO_", ont)]]),
+        file.path(output_dir, paste0("GO_", ont, "_results.csv")),
+        row.names = FALSE
+      )
+      
+      # Create dotplot
+      pdf(file.path(output_dir, paste0("GO_", ont, "_dotplot.pdf")),
+          width = width, height = height)
+      print(dotplot(enrichment_results[[paste0("GO_", ont)]],
+                   showCategory = show_category,
+                   font.size = font_size))
+      dev.off()
+    }
+  }
+  
+  # Perform KEGG enrichment
+  cat("  KEGG enrichment...\n")
+  enrichment_results$KEGG <- enrichKEGG(
+    entrez_ids,
+    organism = "hsa",
+    keyType = "kegg",
+    minGSSize = 1,
+    maxGSSize = 500,
+    pvalueCutoff = kegg_pvalue,
+    pAdjustMethod = "BH",
+    qvalueCutoff = kegg_pvalue
+  )
+  
+  # Save KEGG results
+  if (nrow(as.data.frame(enrichment_results$KEGG)) > 0) {
+    write.csv(
+      as.data.frame(enrichment_results$KEGG),
+      file.path(output_dir, "KEGG_results.csv"),
+      row.names = FALSE
+    )
+    
+    # Create dotplot
+    pdf(file.path(output_dir, "KEGG_dotplot.pdf"),
+        width = width, height = height)
+    print(dotplot(enrichment_results$KEGG,
+                 showCategory = show_category,
+                 font.size = font_size))
+    dev.off()
+  }
+  
+  # Create summary
+  summary_df <- data.frame(
+    Analysis = names(enrichment_results),
+    Significant_Terms = sapply(enrichment_results, function(x) {
+      res_df <- as.data.frame(x)
+      if (nrow(res_df) > 0) nrow(res_df) else 0
+    })
+  )
+  
+  write.csv(summary_df,
+            file.path(output_dir, "enrichment_summary.csv"),
+            row.names = FALSE)
+  
+  cat("Enrichment analysis completed. Results saved to:", output_dir, "\n")
+  return(enrichment_results)
+}
+
+# ============================================================================
+# 6. Venn Diagram Function
+# ============================================================================
+
+#' Create Venn diagram
+#' @param gene_lists Named list of gene vectors
+#' @param output_file Output file path
+#' @param colors Vector of colors (optional)
+#' @param imagetype Image type (default: "png")
+#' @return Venn diagram object
+create_venn_diagram <- function(gene_lists, output_file,
+                               colors = NULL, imagetype = "png") {
+  cat("Creating Venn diagram...\n")
+  
+  if (is.null(colors)) {
+    colors <- c("red", "blue", "green", "orange", "purple")[1:length(gene_lists)]
+  }
+  
+  venn_plot <- venn.diagram(
+    gene_lists,
+    filename = NULL,
+    imagetype = imagetype,
+    fill = colors,
+    alpha = 0.50,
+    cat.col = colors,
+    cat.cex = 1.5,
+    cat.fontfamily = "serif",
+    col = "black",
+    cex = 1.5,
+    fontfamily = "serif"
+  )
+  
+  if (grepl("\\.svg$", output_file)) {
+    ggsave(venn_plot, file = output_file, device = "svg", width = 10, height = 10)
+  } else {
+    ggsave(venn_plot, file = output_file, width = 10, height = 10)
+  }
+  
+  cat("Venn diagram saved to:", output_file, "\n")
+  return(venn_plot)
+}
+
+# ============================================================================
+# 7. Violin Plot Function
+# ============================================================================
+
+#' Create violin plot for gene expression
+#' @param count_matrix Count matrix
+#' @param genes Vector of gene names
+#' @param group_info Named vector or data frame with group information
+#' @param output_file Output file path (optional)
+#' @param facet_by Optional column name for faceting
+#' @return ggplot object
+create_violin_plot <- function(count_matrix, genes, group_info,
+                              output_file = NULL, facet_by = NULL) {
+  cat("Creating violin plot...\n")
+  
+  # Filter genes
+  genes <- intersect(genes, rownames(count_matrix))
+  if (length(genes) == 0) {
+    stop("No matching genes found")
+  }
+  
+  # Extract expression data
+  expr_data <- count_matrix[genes, , drop = FALSE]
+  
+  # Convert to long format
+  expr_long <- as.data.frame(expr_data)
+  expr_long$gene <- rownames(expr_long)
+  expr_long <- pivot_longer(expr_long,
+                           cols = -gene,
+                           names_to = "sample",
+                           values_to = "count")
+  
+  # Add group information
+  if (is.vector(group_info) && is.null(names(group_info))) {
+    # If group_info is a vector, match by position
+    expr_long$group <- group_info[match(expr_long$sample, colnames(count_matrix))]
+  } else if (is.data.frame(group_info)) {
+    # If group_info is a data frame, merge
+    expr_long <- merge(expr_long, group_info, by = "sample", all.x = TRUE)
+  } else {
+    stop("group_info must be a vector or data frame")
+  }
+  
+  # Calculate log2(count + 1)
+  expr_long$log2count <- log2(expr_long$count + 1)
+  
+  # Create plot
+  p <- ggplot(expr_long, aes(x = group, y = log2count, fill = group)) +
+    geom_violin(trim = FALSE) +
+    geom_boxplot(width = 0.2, outlier.shape = NA, fill = "white") +
+    theme_bw() +
+    labs(x = "", y = "log2(count + 1)") +
+    theme(
+      axis.text.x = element_text(size = 14),
+      axis.title.y = element_text(size = 16)
+    )
+  
+  # Add faceting if specified
+  if (!is.null(facet_by)) {
+    p <- p + facet_wrap(as.formula(paste("~", facet_by)), scales = "free_y")
+  } else if (length(genes) > 1) {
+    p <- p + facet_wrap(~gene, scales = "free_y")
+  }
+  
+  # Add statistical test
+  if (length(unique(expr_long$group)) == 2) {
+    p <- p + stat_compare_means(aes(group = group),
+                                method = "t.test",
+                                label = "p.format")
+  }
+  
+  if (!is.null(output_file)) {
+    ggsave(output_file, p, width = 10, height = 6)
+    cat("Violin plot saved to:", output_file, "\n")
+  }
+  
+  return(p)
+}
+
+# ============================================================================
+# 8. Main Analysis Pipeline
+# ============================================================================
+
+#' Main function to run complete RNA-seq analysis pipeline
+#' @param count_file Path to count matrix file
+#' @param group_info Vector or data frame with group information
+#' @param output_dir Output directory (default: "results")
+#' @param gene_id_col Column name for gene IDs (default: "gene_id")
+#' @param min_mean_count Minimum mean count for filtering (default: 1)
+#' @param contrast Contrast vector for DESeq2 (optional)
+#' @param lfc_threshold Log2 fold change threshold (default: 1)
+#' @param pvalue_threshold P-value threshold (default: 0.05)
+#' @return List containing all results
+run_deseq2_analysis <- function(count_file, group_info, output_dir = "results",
+                               gene_id_col = "gene_id", min_mean_count = 1,
+                               contrast = NULL, lfc_threshold = 1,
+                               pvalue_threshold = 0.05) {
+  
+  cat("========================================\n")
+  cat("RNA-seq Differential Expression Analysis\n")
+  cat("========================================\n\n")
+  
+  # Create output directory
+  dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  # Step 1: Read count matrix
+  cat("Step 1: Reading count matrix\n")
+  cat("----------------------------------------\n")
+  count_matrix <- read_count_matrix(count_file, gene_id_col, min_mean_count)
+  cat("\n")
+  
+  # Step 2: Prepare sample information
+  cat("Step 2: Preparing sample information\n")
+  cat("----------------------------------------\n")
+  if (is.vector(group_info)) {
+    if (length(group_info) != ncol(count_matrix)) {
+      stop("Length of group_info must match number of samples")
+    }
+    col_data <- data.frame(
+      row.names = colnames(count_matrix),
+      condition = factor(group_info)
+    )
+  } else if (is.data.frame(group_info)) {
+    col_data <- group_info
+    rownames(col_data) <- colnames(count_matrix)
+  } else {
+    stop("group_info must be a vector or data frame")
+  }
+  
+  cat("Sample groups:\n")
+  print(table(col_data$condition))
+  cat("\n")
+  
+  # Step 3: Run DESeq2
+  cat("Step 3: Running DESeq2 analysis\n")
+  cat("----------------------------------------\n")
+  dds <- run_deseq2(count_matrix, col_data)
+  cat("\n")
+  
+  # Step 4: Extract results
+  cat("Step 4: Extracting differential expression results\n")
+  cat("----------------------------------------\n")
+  res_df <- extract_de_genes(dds, contrast, pvalue_threshold, lfc_threshold)
+  
+  # Save results
+  write.csv(res_df, file.path(output_dir, "differential_expression_results.csv"))
+  
+  # Extract up and down genes
+  up_genes <- rownames(res_df[res_df$regulation == "Up", ])
+  down_genes <- rownames(res_df[res_df$regulation == "Down", ])
+  all_de_genes <- c(up_genes, down_genes)
+  
+  write.csv(data.frame(gene = up_genes),
+            file.path(output_dir, "upregulated_genes.csv"),
+            row.names = FALSE)
+  write.csv(data.frame(gene = down_genes),
+            file.path(output_dir, "downregulated_genes.csv"),
+            row.names = FALSE)
+  cat("\n")
+  
+  # Step 5: Create visualizations
+  cat("Step 5: Creating visualizations\n")
+  cat("----------------------------------------\n")
+  
+  # PCA plot
+  create_pca_plot(dds, file.path(output_dir, "pca_3d.html"), dims = 3)
+  create_pca_plot(dds, file.path(output_dir, "pca_2d.pdf"), dims = 2)
+  
+  # Volcano plot
+  create_volcano_plot(res_df, file.path(output_dir, "volcano_plot.pdf"),
+                     lfc_threshold, pvalue_threshold)
+  
+  # Heatmap
+  if (length(all_de_genes) > 0) {
+    create_expression_heatmap(
+      count_matrix,
+      all_de_genes,
+      output_file = file.path(output_dir, "de_genes_heatmap.pdf"),
+      scale = TRUE,
+      cluster_rows = TRUE,
+      cluster_cols = FALSE
+    )
+  }
+  cat("\n")
+  
+  # Step 6: Enrichment analysis
+  if (length(all_de_genes) > 0) {
+    cat("Step 6: Performing enrichment analysis\n")
+    cat("----------------------------------------\n")
+    
+    # Convert gene IDs if needed
+    if (grepl("ENSG", all_de_genes[1])) {
+      gene_conversion <- convert_gene_ids(all_de_genes, "ENSEMBL", "SYMBOL")
+      de_symbols <- gene_conversion$SYMBOL[!is.na(gene_conversion$SYMBOL)]
+    } else {
+      de_symbols <- all_de_genes
+    }
+    
+    if (length(de_symbols) > 0) {
+      enrichment_results <- perform_enrichment_analysis(
+        de_symbols,
+        output_dir = file.path(output_dir, "enrichment_analysis")
+      )
+    }
+    cat("\n")
+  }
+  
+  cat("========================================\n")
+  cat("Analysis completed!\n")
+  cat("Results saved to:", output_dir, "\n")
+  cat("========================================\n")
+  
+  return(list(
+    dds = dds,
+    results = res_df,
+    up_genes = up_genes,
+    down_genes = down_genes,
+    enrichment = if(exists("enrichment_results")) enrichment_results else NULL
+  ))
+}
+
+# ============================================================================
+# 9. Example Usage
+# ============================================================================
+
+# Example usage (uncomment to run):
+# 
+# # Define groups
+# condition <- factor(c(rep("control", 3), rep("treatment", 3)))
+# 
+# # Run analysis
+# results <- run_deseq2_analysis(
+#   count_file = "gene_count_matrix.csv",
+#   group_info = condition,
+#   output_dir = "deseq2_results",
+#   lfc_threshold = 1,
+#   pvalue_threshold = 0.05
+# )
+# 
+# # Create Venn diagram for multiple comparisons
+# gene_lists <- list(
+#   Comparison1 = results1$up_genes,
+#   Comparison2 = results2$up_genes,
+#   Comparison3 = results3$up_genes
+# )
+# create_venn_diagram(gene_lists, "venn_diagram.png")

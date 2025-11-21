@@ -1,0 +1,442 @@
+#!/bin/bash
+
+# ChIP-seq Data Processing Pipeline
+# 
+# Description:
+#   This script performs end-to-end ChIP-seq data processing including:
+#   - Quality control and adapter trimming
+#   - Alignment to reference genome
+#   - Duplicate removal and quality filtering
+#   - Read normalization across samples
+#   - BigWig file generation
+#   - Peak calling
+#   - FRiP (Fraction of Reads in Peaks) calculation
+
+# Requirements:
+#   - fastp (for adapter trimming)
+#   - bowtie2 (for alignment)
+#   - samtools (for BAM processing)
+#   - picard (for read downsampling)
+#   - deeptools (for BigWig generation)
+#   - MACS2 (for peak calling)
+#   - bedtools (for peak analysis)
+#
+# Usage:
+#   bash chipseq_pipeline.sh -w /path/to/workdir -b /path/to/bowtie2/index
+#
+# Example:
+#   bash chipseq_pipeline.sh -w /data/chipseq/ -b /data/indexes/hg38
+#
+###############################################################################
+
+set -e  # Exit on error
+set -u  # Exit on undefined variable
+
+# ============================================================================
+# Function Definitions
+# ============================================================================
+
+# Print error message and exit
+error_exit() {
+    echo "ERROR: $1" >&2
+    exit 1
+}
+
+# Print usage information
+usage() {
+    cat << EOF
+Usage: $0 -w WORKDIR -b BOWTIE2_INDEX
+
+Required arguments:
+    -w WORKDIR         Working directory path
+    -b BOWTIE2_INDEX   Path to Bowtie2 index (without .bt2 extension)
+
+Optional arguments:
+    -h                 Show this help message
+
+Example:
+    $0 -w /data/chipseq/ -b /data/indexes/hg38
+
+EOF
+}
+
+# Check if a command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Check required tools
+check_dependencies() {
+    local missing_tools=()
+    
+    for tool in fastp bowtie2 samtools java bamCoverage macs2 bedtools bc awk; do
+        if ! command_exists "$tool"; then
+            missing_tools+=("$tool")
+        fi
+    done
+    
+    if [ ${#missing_tools[@]} -ne 0 ]; then
+        error_exit "Missing required tools: ${missing_tools[*]}"
+    fi
+    
+    # Check for Picard JAR file
+    if [ -z "${PICARD_JAR:-}" ]; then
+        if [ -f "/home/hdw/picard.jar" ]; then
+            PICARD_JAR="/home/hdw/picard.jar"
+        else
+            error_exit "Picard JAR file not found. Please set PICARD_JAR environment variable."
+        fi
+    fi
+}
+
+# ============================================================================
+# Parse Command Line Arguments
+# ============================================================================
+
+WORKDIR=""
+BOWTIE2_INDEX=""
+
+while getopts "w:b:h" flag; do
+    case "${flag}" in
+        w) WORKDIR="${OPTARG}" ;;
+        b) BOWTIE2_INDEX="${OPTARG}" ;;
+        h) usage; exit 0 ;;
+        *) usage; error_exit "Invalid option: -${flag}" ;;
+    esac
+done
+
+# Validate required arguments
+if [ -z "$WORKDIR" ]; then
+    error_exit "Work directory (-w) is required"
+fi
+
+if [ -z "$BOWTIE2_INDEX" ]; then
+    error_exit "Bowtie2 index path (-b) is required"
+fi
+
+# Check dependencies
+check_dependencies
+
+# ============================================================================
+# Directory Setup
+# ============================================================================
+
+# Normalize paths (remove trailing slashes)
+WORKDIR="${WORKDIR%/}"
+BOWTIE2_INDEX="${BOWTIE2_INDEX%/}"
+
+# Define directory paths
+FASTQ_DIR="${WORKDIR}/fastq/"
+HG38_DIR="${WORKDIR}/hg38/"
+TRIM_DIR="${WORKDIR}/trim/"
+BW_DIR="${WORKDIR}/bw/"
+
+# Create output directories
+mkdir -p "$HG38_DIR" "$TRIM_DIR" "$BW_DIR" || error_exit "Failed to create directories"
+
+# Check if fastq directory exists
+if [ ! -d "$FASTQ_DIR" ]; then
+    error_exit "FastQ directory not found: $FASTQ_DIR"
+fi
+
+# Check if Bowtie2 index exists
+if [ ! -f "${BOWTIE2_INDEX}.1.bt2" ] && [ ! -f "${BOWTIE2_INDEX}.rev.1.bt2" ]; then
+    error_exit "Bowtie2 index not found: $BOWTIE2_INDEX"
+fi
+
+echo "=========================================="
+echo "ChIP-seq Processing Pipeline"
+echo "=========================================="
+echo "Working directory: $WORKDIR"
+echo "Bowtie2 index: $BOWTIE2_INDEX"
+echo "FastQ directory: $FASTQ_DIR"
+echo "=========================================="
+echo ""
+
+# ============================================================================
+# Get Sample List
+# ============================================================================
+
+SAMPLE_LIST_FILE="${WORKDIR}/sample_list.txt"
+READS_NUMBER_FILE="${WORKDIR}/reads_number.txt"
+PEAK_NUMBER_FILE="${WORKDIR}/peak_number.txt"
+FRIP_FILE="${WORKDIR}/FRiP.txt"
+COMBINE_FILE="${WORKDIR}/reads_number_combine.txt"
+FINAL_OUTPUT="${WORKDIR}/sample_statistics.txt"
+
+# Initialize output files
+> "$READS_NUMBER_FILE"
+> "$PEAK_NUMBER_FILE"
+> "$FRIP_FILE"
+
+# Get list of samples from fastq directory
+cd "$FASTQ_DIR" || error_exit "Cannot access FastQ directory"
+ls -d */ 2>/dev/null | sed 's|/$||' > "$SAMPLE_LIST_FILE" || error_exit "Failed to list samples"
+
+if [ ! -s "$SAMPLE_LIST_FILE" ]; then
+    error_exit "No samples found in $FASTQ_DIR"
+fi
+
+SAMPLE_COUNT=$(wc -l < "$SAMPLE_LIST_FILE")
+echo "Found $SAMPLE_COUNT samples"
+echo ""
+
+# ============================================================================
+# Process Each Sample
+# ============================================================================
+
+cd "$WORKDIR" || error_exit "Cannot access working directory"
+
+while IFS= read -r sample; do
+    if [ -z "$sample" ]; then
+        continue
+    fi
+    
+    echo "----------------------------------------"
+    echo "Processing sample: $sample"
+    echo "----------------------------------------"
+    
+    # Define file paths for this sample
+    R1_INPUT="${FASTQ_DIR}${sample}/${sample}_R1.fq.gz"
+    R2_INPUT="${FASTQ_DIR}${sample}/${sample}_R2.fq.gz"
+    R1_OUTPUT="${TRIM_DIR}${sample}/${sample}_R1_paired.fq.gz"
+    R2_OUTPUT="${TRIM_DIR}${sample}/${sample}_R2_paired.fq.gz"
+    
+    SAMPLE_TRIM_DIR="${TRIM_DIR}${sample}/"
+    SAMPLE_HG38_DIR="${HG38_DIR}${sample}/"
+    SAMPLE_BW_DIR="${BW_DIR}${sample}/"
+    
+    BAM_FILE="${SAMPLE_HG38_DIR}${sample}-hg38.bam"
+    BAM_Q30="${SAMPLE_HG38_DIR}${sample}-hg38-q30.bam"
+    BAM_Q30_RMDUP="${SAMPLE_HG38_DIR}${sample}-hg38-q30-rmdup.bam"
+    BAM_NORMALIZED="${SAMPLE_HG38_DIR}${sample}-hg38-q30-rmdup-nor.bam"
+    
+    # ========================================================================
+    # Step 1: Quality Control and Adapter Trimming
+    # ========================================================================
+    echo "[Step 1/6] Quality control and adapter trimming..."
+    
+    mkdir -p "$SAMPLE_TRIM_DIR" || error_exit "Failed to create trim directory"
+    
+    if [ ! -f "$R1_INPUT" ] || [ ! -f "$R2_INPUT" ]; then
+        echo "WARNING: Input files not found for $sample, skipping..."
+        continue
+    fi
+    
+    fastp \
+        -i "$R1_INPUT" \
+        -I "$R2_INPUT" \
+        -o "$R1_OUTPUT" \
+        -O "$R2_OUTPUT" \
+        --adapter_sequence=GATCGGAAGAGCACACGTCTGAACTCCAGTCAC \
+        --adapter_sequence_r2=AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGTA \
+        -g 30 \
+        -3 \
+        -l 50 \
+        --json "${SAMPLE_TRIM_DIR}${sample}_fastp.json" \
+        --html "${SAMPLE_TRIM_DIR}${sample}_fastp.html" \
+        || error_exit "fastp failed for $sample"
+    
+    # ========================================================================
+    # Step 2: Alignment to Reference Genome
+    # ========================================================================
+    echo "[Step 2/6] Aligning to reference genome..."
+    
+    mkdir -p "$SAMPLE_HG38_DIR" || error_exit "Failed to create alignment directory"
+    
+    bowtie2 \
+        -p 10 \
+        -x "$BOWTIE2_INDEX" \
+        -1 "$R1_OUTPUT" \
+        -2 "$R2_OUTPUT" \
+        | samtools sort -O bam -@ 10 -o - \
+        > "$BAM_FILE" \
+        || error_exit "Alignment failed for $sample"
+    
+    # ========================================================================
+    # Step 3: Quality Filtering and Duplicate Removal
+    # ========================================================================
+    echo "[Step 3/6] Quality filtering and duplicate removal..."
+    
+    # Filter: MAPQ >= 30, remove unmapped reads (flag 4)
+    samtools view -q 30 -F 4 -bh -@ 16 "$BAM_FILE" > "$BAM_Q30" \
+        || error_exit "Quality filtering failed for $sample"
+    
+    # Remove duplicates
+    samtools rmdup -s "$BAM_Q30" "$BAM_Q30_RMDUP" \
+        || error_exit "Duplicate removal failed for $sample"
+    
+    # Count reads
+    read_count=$(samtools view -c "$BAM_Q30_RMDUP")
+    echo "$read_count" >> "$READS_NUMBER_FILE"
+    echo "  Reads after filtering: $read_count"
+    
+    # ========================================================================
+    # Step 4: Read Normalization
+    # ========================================================================
+    echo "[Step 4/6] Normalizing reads across samples..."
+    
+    # Find minimum read count (will be calculated after all samples are processed)
+    # For now, we'll do this in a second pass
+    
+done < "$SAMPLE_LIST_FILE"
+
+# ============================================================================
+# Step 5: Normalize All Samples to Minimum Read Count
+# ============================================================================
+
+echo ""
+echo "=========================================="
+echo "Normalizing reads across all samples"
+echo "=========================================="
+
+# Find minimum read count
+MIN_READS=$(awk 'BEGIN{min = 1000000000} {if ($1 < min && $1 > 0) min = $1} END{printf "%.0f", min}' "$READS_NUMBER_FILE")
+
+if [ "$MIN_READS" -eq 0 ] || [ "$MIN_READS" -eq 1000000000 ]; then
+    error_exit "Failed to determine minimum read count"
+fi
+
+echo "Minimum read count: $MIN_READS"
+echo ""
+
+# Process normalization for each sample
+while IFS= read -r sample; do
+    if [ -z "$sample" ]; then
+        continue
+    fi
+    
+    echo "Normalizing sample: $sample"
+    
+    SAMPLE_HG38_DIR="${HG38_DIR}${sample}/"
+    BAM_Q30_RMDUP="${SAMPLE_HG38_DIR}${sample}-hg38-q30-rmdup.bam"
+    BAM_NORMALIZED="${SAMPLE_HG38_DIR}${sample}-hg38-q30-rmdup-nor.bam"
+    SAMPLE_BW_DIR="${BW_DIR}${sample}/"
+    
+    # Get read count for this sample
+    undump_reads=$(grep -w "$sample" <(paste "$SAMPLE_LIST_FILE" "$READS_NUMBER_FILE") | awk '{print $2}')
+    
+    if [ -z "$undump_reads" ] || [ "$undump_reads" -eq 0 ]; then
+        echo "WARNING: No reads found for $sample, skipping normalization..."
+        continue
+    fi
+    
+    # Calculate downsampling probability
+    P=$(awk "BEGIN {printf \"%.4f\", $MIN_READS/$undump_reads}")
+    echo "  Downsampling probability: $P"
+    
+    # Downsample using Picard
+    java -jar "$PICARD_JAR" DownsampleSam \
+        I="$BAM_Q30_RMDUP" \
+        O="$BAM_NORMALIZED" \
+        P="$P" \
+        R=1 \
+        || error_exit "Downsampling failed for $sample"
+    
+    # Index BAM file
+    samtools index "$BAM_NORMALIZED" \
+        || error_exit "Indexing failed for $sample"
+    
+    # ========================================================================
+    # Step 6: Generate BigWig Files
+    # ========================================================================
+    echo "[Step 5/6] Generating BigWig file..."
+    
+    mkdir -p "$SAMPLE_BW_DIR" || error_exit "Failed to create BigWig directory"
+    
+    bamCoverage \
+        --bam "$BAM_NORMALIZED" \
+        -o "${SAMPLE_BW_DIR}${sample}.bw" \
+        --binSize 10 \
+        --normalizeUsing RPKM \
+        --numberOfProcessors max \
+        || error_exit "BigWig generation failed for $sample"
+    
+    # ========================================================================
+    # Step 7: Peak Calling
+    # ========================================================================
+    echo "[Step 6/6] Calling peaks..."
+    
+    cd "$SAMPLE_HG38_DIR" || error_exit "Cannot access sample directory"
+    
+    macs2 callpeak \
+        -t "$BAM_NORMALIZED" \
+        -n "$sample" \
+        -g hs \
+        --bdg \
+        || error_exit "Peak calling failed for $sample"
+    
+    # Count peaks
+    PEAK_FILE="${SAMPLE_HG38_DIR}${sample}_peaks.narrowPeak"
+    if [ -f "$PEAK_FILE" ]; then
+        peak_count=$(wc -l < "$PEAK_FILE")
+        echo "$peak_count" >> "$PEAK_NUMBER_FILE"
+        echo "  Peaks called: $peak_count"
+    else
+        echo "0" >> "$PEAK_NUMBER_FILE"
+        echo "  WARNING: No peak file generated"
+    fi
+    
+    # ========================================================================
+    # Step 8: Calculate FRiP (Fraction of Reads in Peaks)
+    # ========================================================================
+    echo "Calculating FRiP..."
+    
+    BED_FILE="${SAMPLE_HG38_DIR}${sample}.bed"
+    
+    # Convert BAM to BED
+    bedtools bamtobed -i "$BAM_NORMALIZED" > "$BED_FILE" \
+        || error_exit "BAM to BED conversion failed for $sample"
+    
+    if [ -f "$PEAK_FILE" ] && [ -s "$PEAK_FILE" ]; then
+        # Count reads in peaks
+        peak_reads=$(bedtools intersect -a "$BED_FILE" -b "$PEAK_FILE" | wc -l | awk '{print $1}')
+        total_reads=$(wc -l < "$BED_FILE" | awk '{print $1}')
+        
+        if [ "$total_reads" -gt 0 ]; then
+            FRIP=$(awk "BEGIN {printf \"%.4f\", 100*$peak_reads/$total_reads}")
+            echo "${FRIP}%" >> "$FRIP_FILE"
+            echo "  FRiP: ${FRIP}%"
+        else
+            echo "0.0000%" >> "$FRIP_FILE"
+            echo "  WARNING: No reads found"
+        fi
+    else
+        echo "0.0000%" >> "$FRIP_FILE"
+        echo "  WARNING: No peaks found, FRiP = 0%"
+    fi
+    
+    cd "$WORKDIR" || error_exit "Cannot return to working directory"
+    echo ""
+    
+done < "$SAMPLE_LIST_FILE"
+
+# ============================================================================
+# Generate Summary Statistics
+# ============================================================================
+
+echo "=========================================="
+echo "Generating summary statistics"
+echo "=========================================="
+
+# Combine all statistics
+paste "$SAMPLE_LIST_FILE" "$READS_NUMBER_FILE" "$PEAK_NUMBER_FILE" "$FRIP_FILE" > "$COMBINE_FILE"
+
+# Add header and format output
+awk 'BEGIN {
+    printf "%-20s\t%15s\t%15s\t%15s\n", "Sample", "Reads", "Peaks", "FRiP"
+    printf "%-20s\t%15s\t%15s\t%15s\n", "--------------------", "---------------", "---------------", "---------------"
+}
+{
+    printf "%-20s\t%15s\t%15s\t%15s\n", $1, $2, $3, $4
+}' "$COMBINE_FILE" > "$FINAL_OUTPUT"
+
+echo ""
+echo "Summary statistics saved to: $FINAL_OUTPUT"
+echo ""
+cat "$FINAL_OUTPUT"
+echo ""
+
+echo "=========================================="
+echo "Pipeline completed successfully!"
+echo "=========================================="

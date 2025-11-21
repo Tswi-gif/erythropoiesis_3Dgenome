@@ -1,0 +1,399 @@
+# Hi-C Data Processing Steps and Tools
+
+## Overview
+
+This document describes the data processing workflow for BL-HiC (Blood Lineage Hi-C) experiments, including complete steps from raw sequencing data to final visualization and analysis.
+
+## Required Tools
+
+### Core Tools
+
+- **trimLinker** (from **ChIA-PET2**): Hi-C linker removal tool
+- **HiC-Pro**: Main Hi-C data processing pipeline tool
+- **hicNormalize**: Hi-C data normalization tool (from HiCExplorer)
+- **hicCorrectMatrix**: Hi-C matrix correction tool (from HiCExplorer)
+- **hicFindTADs**: TAD (Topologically Associating Domain) identification tool (from HiCExplorer)
+- **hicPlotMatrix**: Hi-C matrix visualization tool (from HiCExplorer)
+- **hicPlotDistVsCounts**: Distance-count relationship visualization tool (from HiCExplorer)
+- **juicer_tools**: Juicer format conversion and PC1 calculation tool
+- **HOMER**: For Hi-C data analysis and compaction statistics
+- **bedtools**: Genomic interval manipulation tool
+- **samtools**: BAM file processing tool
+
+### Auxiliary Tools
+
+- **awk**: Text processing
+- **sort**: Sorting tool
+- **shuf**: Random sampling tool
+- **bc**: Numerical calculation
+
+---
+
+## Processing Steps
+
+### Step 1: Linker Trimming
+
+**Tool**: `trimLinker` (from ChIA-PET2 package)
+
+**Purpose**: Remove linker sequences from Hi-C sequencing data
+
+**Key Parameters**:
+
+- `-t`: Number of threads
+- `-o`: Output directory
+- `-m`: Pattern matching parameter
+- `-k`: k-mer length
+- `-e`: Error tolerance
+- `-A`: R1 linker sequence
+- `-B`: R2 linker sequence
+- `-f`: R1 input file
+- `-r`: R2 input file
+- `-n`: Sample name
+
+**Example Command**:
+trimLinker \
+    -t 128 \
+    -o /mnt/efs/fs1/hic-data/ORTH/ \
+    -m 1 \
+    -k 2 \
+    -e 1 \
+    -A ACGCGATATCTTATC \
+    -B AGTCAGATAAGATAT \
+    -f ORTH_R1.fq.gz \
+    -r ORTH_R2.fq.gz \
+    -n ORTH**Output**: FastQ files with linkers removed
+
+---
+
+### Step 2: HiC-Pro Main Pipeline Processing
+
+**Tool**: `HiC-Pro`
+
+**Purpose**: Execute complete Hi-C data processing pipeline, including alignment, filtering, binning, etc.
+
+**Key Parameters**:
+
+- `-i`: Input directory (containing trimLinker output)
+- `-o`: Output directory
+- `-c`: Configuration file path
+
+**Example Command**:
+HiC-Pro \
+    -i /data-on-efs/hic_data/trimLinker/CFU \
+    -o /data-on-efs/hic_data/hic_results_CFU/ \
+    -c /data-on-efs/HiC-Pro-3.1.0/config-hicpro.txt**Output**: 
+- `allValidPairs`: Valid pairs file
+- Various statistics and quality control files
+
+---
+
+### Step 3: Data Filtering (Cis/Trans Separation)
+
+**Tool**: `awk`, `shuf`, `sort`
+
+**Purpose**: Separate Hi-C interaction data into cis (intra-chromosomal) and trans (inter-chromosomal) categories
+
+#### 3.1 Extract Cis Interactions
+
+**Filter Condition**: Column 2 (chr1) equals column 5 (chr2)
+
+**Example Commands**:
+# Extract cis interactions
+awk '$2==$5' ${sample}.allValidPairs > ${sample}_cis.allValidPairs
+
+# Random sampling (if needed)
+shuf -n248800000 ${sample}_cis.allValidPairs > ${sample}_cis1.allValidPairs
+
+# Sort and deduplicate
+LANG=en; sort -T tmp -S 50% -k2,2V -k3,3n -k5,5V -k6,6n \
+    -m ${sample}_cis.allValidPairs | \
+    awk -F"\t" 'BEGIN{c1=0;c2=0;s1=0;s2=0}
+    (c1!=$2 || c2!=$5 || s1!=$3 || s2!=$6){print;c1=$2;c2=$5;s1=$3;s2=$6}' \
+    > ${sample}_cis2.allValidPairs#### 3.2 Extract Trans Interactions
+
+**Filter Condition**: Column 2 (chr1) does not equal column 5 (chr2)
+
+**Example Commands**:ash
+# Extract trans interactions
+awk '$2!=$5' ${sample}.allValidPairs > ${sample}_trans.allValidPairs
+
+# Random sampling (if needed)
+shuf -n61590000 ${sample}_trans.allValidPairs > ${sample}_trans1.allValidPairs
+
+# Sort and deduplicate (same as cis)#### 3.3 Merge Cis and Trans
+
+**Example Command**:
+cat ${sample}_cis.allValidPairs ${sample}_trans.allValidPairs > ${sample}_cis_trans.allValidPairs**Output**: 
+- `*_cis.allValidPairs`: Intra-chromosomal interactions
+- `*_trans.allValidPairs`: Inter-chromosomal interactions
+- `*_cis_trans.allValidPairs`: Merged file
+
+---
+
+### Step 4: Format Conversion
+
+**Tool**: `hicpro2juicebox.sh`, `hicpro2higlass.sh`
+
+**Purpose**: Convert HiC-Pro output to Juicer and HiGlass formats
+
+#### 4.1 Convert to Juicer Format
+
+**Example Command**:
+bash /path/to/HiC-Pro-3.1.0/bin/utils/hicpro2juicebox.sh \
+    -i ${sample}_cis_trans.allValidPairs \
+    -j /path/to/juicer_tools_1.22.01.jar \
+    -g /path/to/hg38_chromtin.sizes \
+    -o /path/to/juicer/ \
+    -t /path/to/tmp**Output**: `.hic` format file
+
+#### 4.2 Convert to HiGlass Format
+
+**Example Command**:
+bash /path/to/HiC-Pro-3.1.0/bin/utils/hicpro2higlass.sh \
+    -i ${sample}_cis_trans.allValidPairs \
+    -c /path/to/hg38_chromtin.sizes \
+    -n \
+    -o /path/to/cool/ \
+    -t /path/to/tmp1 \
+    -r 100000**Output**: `.cool` format file (multi-resolution)
+
+---
+
+### Step 5: Data Normalization
+
+**Tool**: `hicNormalize`
+
+**Purpose**: Normalize Hi-C matrices across different samples to make them comparable
+
+**Normalization Method**: `smallest` (normalize to the sample with the smallest number of reads)
+
+**Example Command**:
+hicNormalize \
+    --matrices CFU_cis_250000_KR_correct.cool \
+              PROE_cis_250000_KR_correct.cool \
+              EB_cis_250000_KR_correct.cool \
+              LB_cis_250000_KR_correct.cool \
+              POLY_cis_250000_KR_correct.cool \
+              ORTH_cis_250000_KR_correct.cool \
+    -o CFU_cis_250000_KR_correct_nor.cool \
+       PROE_cis_250000_KR_correct_nor.cool \
+       EB_cis_250000_KR_correct_nor.cool \
+       LB_cis_250000_KR_correct_nor.cool \
+       POLY_cis_250000_KR_correct_nor.cool \
+       ORTH_cis_250000_KR_correct_nor.cool \
+    --normalize smallest**Output**: Normalized `.cool` files
+
+---
+
+### Step 6: Matrix Correction
+
+**Tool**: `hicCorrectMatrix`
+
+**Purpose**: Correct systematic biases in Hi-C matrices (e.g., GC content, mappability, etc.)
+
+#### 6.1 Diagnostic Plot Generation
+
+**Example Command**:
+hicCorrectMatrix diagnostic_plot \
+    --matrix ${sample}_cis_50000.cool \
+    -o ${sample}_cis_50000.png**Output**: Diagnostic plot for evaluating correction effectiveness
+
+#### 6.2 Matrix Correction
+
+**Correction Method**: KR (Knight-Ruiz) balancing
+
+**Example Command**:
+hicCorrectMatrix correct \
+    --matrix ${sample}_cis_250000.cool \
+    --correctionMethod KR \
+    --outFileName ${sample}_cis_250000_KR_correct.cool \
+    --filterThreshold -1 5**Key Parameters**:
+
+- `--correctionMethod KR`: Use KR balancing method
+- `--filterThreshold -1 5`: Filter threshold settings
+
+**Output**: Corrected `.cool` file
+
+---
+
+### Step 7: PC1 (Principal Component 1) Calculation
+
+**Tool**: `juicer_tools`
+
+**Purpose**: Calculate the first principal component (PC1) for identifying A/B compartments
+
+**Example Command**:
+java -jar juicer_tools_1.22.01.jar eigenvector \
+    -p KR \
+    ${sample}_cis.allValidPairs.hic \
+    chr${chr} \
+    BP \
+    50000 \
+    ${sample}/${chr}_eigen.txt**Key Parameters**:
+
+- `-p KR`: Use KR normalization
+- `BP`: Unit (base pairs)
+- `50000`: Resolution (50kb)
+
+**Output**: PC1 value file (one PC1 value per bin per line)
+
+---
+
+### Step 8: Compaction Statistics
+
+**Tool**: HOMER (`makeTagDirectory`, `analyzeHiC`)
+
+**Purpose**: Analyze compaction characteristics of Hi-C data
+
+#### 8.1 Create Tag Directory
+
+**Example Command**:
+makeTagDirectory \
+    /path/to/homer/$sample/ \
+    -format HiCsummary \
+    ${sample}_cis_trans.allValidPairs \
+    -tbp 1#### 8.2 Analyze Hi-C Data
+
+**Example Command**:sh
+analyzeHiC \
+    /path/to/homer/$sample/ \
+    -res 50000 \
+    -window 100000 \
+    -nomatrix \
+    -compactionStats auto \
+    -cpu 64**Key Parameters**:
+
+- `-res 50000`: Resolution (50kb)
+- `-window 100000`: Window size (100kb)
+- `-compactionStats auto`: Automatically calculate compaction statistics
+
+**Output**: Compaction statistics file
+
+---
+
+### Step 9: TAD (Topologically Associating Domain) Identification
+
+**Tool**: `hicFindTADs`
+
+**Purpose**: Identify topologically associating domains (TADs)
+
+**Example Command**:h
+hicFindTADs \
+    -m ${sample}_cis_50000_KR_correct_nor.cool \
+    --outPrefix ${sample}_0.01 \
+    --numberOfProcessors 64 \
+    --correctForMultipleTesting fdr \
+    --delta 0.01 \
+    --minDepth 150000 \
+    --maxDepth 500000 \
+    --step 50000**Key Parameters**:
+
+- `--delta 0.01`: Delta value for TAD boundary detection
+- `--minDepth 150000`: Minimum depth (150kb)
+- `--maxDepth 500000`: Maximum depth (500kb)
+- `--step 50000`: Step size (50kb)
+- `--correctForMultipleTesting fdr`: FDR multiple testing correction
+
+**Output**: 
+- TAD boundary BED file
+- TAD statistics file
+
+---
+
+### Step 10: Visualization
+
+#### 10.1 Matrix Heatmap
+
+**Tool**: `hicPlotMatrix`
+
+**Purpose**: Generate heatmaps of Hi-C interaction matrices
+
+**Example Command**:
+hicPlotMatrix \
+    --matrix ${sample}_cis_250000_KR_correct_nor.cool \
+    --outFileName ${sample}_cis_chr2.png \
+    --region chr2:0-85000000 \
+    --colorMap Reds \
+    --dpi 300 \
+    --log \
+    --vMin 1 \
+    --vMax 10000**Key Parameters**:
+
+- `--region`: Genomic region to visualize
+- `--colorMap`: Color scheme
+- `--log`: Logarithmic transformation
+- `--vMin/vMax`: Value range
+
+**Output**: PNG format heatmap
+
+#### 10.2 Distance-Count Relationship Plot
+
+**Tool**: `hicPlotDistVsCounts`
+
+**Purpose**: Visualize changes in interaction strength with distance
+
+**Example Command**:
+hicPlotDistVsCounts \
+    --matrices ${sample}_cis_50000_KR_correct_nor.cool \
+    --labels ${sample} \
+    -o ${sample}_cis_50000_KR_vs_counts_TAD.pdf \
+    --plotsize 6 8 \
+    --maxdepth 100000000 \
+    --outFileData ${sample}_cis_50000.txt \
+    --domains /path/to/tad_cluster.bed**Key Parameters**:
+
+- `--matrices`: Input matrix file
+- `--domains`: TAD domain file (optional)
+- `--maxdepth`: Maximum distance
+- `--plotsize`: Image size
+
+**Output**: PDF format distance-count relationship plot
+
+---
+
+## File Format Descriptions
+
+### allValidPairs Format
+
+Standard format output by HiC-Pro, containing the following columns:
+
+1. Read name
+2. Chr1 (chromosome of first read)
+3. Pos1 (position of first read)
+4. Strand1 (strand of first read)
+5. Chr2 (chromosome of second read)
+6. Pos2 (position of second read)
+7. Strand2 (strand of second read)
+8. Additional information (quality scores, etc.)
+
+### .cool Format
+
+HDF5-based Hi-C matrix storage format supporting multiple resolutions.
+
+### .hic Format
+
+Native format of Juicer tools, supporting multiple resolutions and various normalization methods.
+
+---
+
+## Notes
+
+1. **Memory Requirements**: Hi-C data processing requires substantial memory; at least 64GB RAM is recommended
+2. **Storage Space**: Raw data and intermediate processing files require significant storage space (hundreds of GB per sample may be needed)
+3. **Computing Time**: The complete workflow may take several days; use of a high-performance computing cluster is recommended
+4. **Parameter Adjustment**: Adjust parameters according to data quality and research objectives (e.g., resolution, window size, etc.)
+5. **Quality Control**: Check the quality and integrity of output files after each step
+
+---
+
+## References
+
+- **ChIA-PET2**: Li et al. (2017) ChIA-PET2: a versatile and flexible pipeline for ChIA-PET data analysis. *Nucleic Acids Research*, 45(1):e4. doi: 10.1093/nar/gkw809
+
+- **HiC-Pro**: Servant et al. (2015) HiC-Pro: an optimized and flexible pipeline for Hi-C data processing. *Genome Biology*, 16:259. doi: 10.1186/s13059-015-0831-x
+
+- **HiCExplorer**: Ramírez et al. (2018) High-resolution TADs reveal DNA sequences underlying genome organization in flies. *Nature Communications*, 9:189. doi: 10.1038/s41467-017-02525-w
+
+- **Juicer**: Durand et al. (2016) Juicer provides a one-click system for analyzing loop-resolution Hi-C experiments. *Cell Systems*, 3(1):95-98. doi: 10.1016/j.cels.2016.07.002
+
+- **HOMER**: Heinz et al. (2010) Simple combinations of lineage-determining transcription factors prime cis-regulatory elements required for macrophage and B cell identities. *Molecular Cell*, 38(4):576-589. doi: 10.1016/j.molcel.2010.05.004 

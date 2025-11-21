@@ -1,0 +1,392 @@
+#!/bin/bash
+
+###############################################################################
+# RNA-seq Data Processing Pipeline
+# 
+# Description:
+#   This script performs end-to-end RNA-seq data processing including:
+#   - Quality control and adapter trimming using fastp
+#   - Alignment to reference genome using STAR
+#   - Gene and transcript expression quantification using RSEM
+#   - Expression matrix generation
+#
+# Requirements:
+#   - fastp (for adapter trimming)
+#   - STAR (for alignment)
+#   - RSEM (for expression quantification)
+#   - awk, paste, cut (standard Unix tools)
+#
+# Usage:
+#   bash rnaseq_pipeline.sh -w /path/to/workdir -s /path/to/STAR/index -r /path/to/RSEM/index
+#
+# Example:
+#   bash rnaseq_pipeline.sh -w /data/rnaseq/ -s /data/indexes/STAR_hg38 -r /data/indexes/RSEM_hg38
+#
+###############################################################################
+
+set -e  # Exit on error
+set -u  # Exit on undefined variable
+
+# ============================================================================
+# Function Definitions
+# ============================================================================
+
+# Print error message and exit
+error_exit() {
+    echo "ERROR: $1" >&2
+    exit 1
+}
+
+# Print usage information
+usage() {
+    cat << EOF
+Usage: $0 -w WORKDIR -s STAR_INDEX -r RSEM_INDEX
+
+Required arguments:
+    -w WORKDIR         Working directory path
+    -s STAR_INDEX      Path to STAR genome index directory
+    -r RSEM_INDEX      Path to RSEM reference prefix (without .transcript.fa extension)
+
+Optional arguments:
+    -h                 Show this help message
+    -t THREADS         Number of threads (default: 32)
+    -g GROUP_FILE      Path to group file for combining replicates (optional)
+
+Example:
+    $0 -w /data/rnaseq/ -s /data/indexes/STAR_hg38 -r /data/indexes/RSEM_hg38
+
+EOF
+}
+
+# Check if a command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Check required tools
+check_dependencies() {
+    local missing_tools=()
+    
+    for tool in fastp STAR rsem-calculate-expression rsem-generate-data-matrix awk paste cut; do
+        if ! command_exists "$tool"; then
+            missing_tools+=("$tool")
+        fi
+    done
+    
+    if [ ${#missing_tools[@]} -ne 0 ]; then
+        error_exit "Missing required tools: ${missing_tools[*]}"
+    fi
+}
+
+# ============================================================================
+# Parse Command Line Arguments
+# ============================================================================
+
+WORKDIR=""
+STAR_INDEX=""
+RSEM_INDEX=""
+THREADS=32
+GROUP_FILE=""
+
+while getopts "w:s:r:t:g:h" flag; do
+    case "${flag}" in
+        w) WORKDIR="${OPTARG}" ;;
+        s) STAR_INDEX="${OPTARG}" ;;
+        r) RSEM_INDEX="${OPTARG}" ;;
+        t) THREADS="${OPTARG}" ;;
+        g) GROUP_FILE="${OPTARG}" ;;
+        h) usage; exit 0 ;;
+        *) usage; error_exit "Invalid option: -${flag}" ;;
+    esac
+done
+
+# Validate required arguments
+if [ -z "$WORKDIR" ]; then
+    error_exit "Work directory (-w) is required"
+fi
+
+if [ -z "$STAR_INDEX" ]; then
+    error_exit "STAR index path (-s) is required"
+fi
+
+if [ -z "$RSEM_INDEX" ]; then
+    error_exit "RSEM index path (-r) is required"
+fi
+
+# Check dependencies
+check_dependencies
+
+# ============================================================================
+# Directory Setup
+# ============================================================================
+
+# Normalize paths (remove trailing slashes)
+WORKDIR="${WORKDIR%/}"
+STAR_INDEX="${STAR_INDEX%/}"
+RSEM_INDEX="${RSEM_INDEX%/}"
+
+# Define directory paths
+FASTQ_DIR="${WORKDIR}/fastq/"
+HG38_DIR="${WORKDIR}/hg38/"
+TRIM_DIR="${WORKDIR}/trim/"
+
+# Create output directories
+mkdir -p "$HG38_DIR" "$TRIM_DIR" || error_exit "Failed to create directories"
+
+# Check if fastq directory exists
+if [ ! -d "$FASTQ_DIR" ]; then
+    error_exit "FastQ directory not found: $FASTQ_DIR"
+fi
+
+# Check if STAR index exists
+if [ ! -d "$STAR_INDEX" ] || [ ! -f "${STAR_INDEX}/Genome" ]; then
+    error_exit "STAR index not found or invalid: $STAR_INDEX"
+fi
+
+# Check if RSEM index exists
+if [ ! -f "${RSEM_INDEX}.transcript.fa" ]; then
+    error_exit "RSEM index not found: ${RSEM_INDEX}.transcript.fa"
+fi
+
+echo "=========================================="
+echo "RNA-seq Processing Pipeline"
+echo "=========================================="
+echo "Working directory: $WORKDIR"
+echo "STAR index: $STAR_INDEX"
+echo "RSEM index: $RSEM_INDEX"
+echo "Threads: $THREADS"
+echo "=========================================="
+echo ""
+
+# ============================================================================
+# Get Sample List
+# ============================================================================
+
+SAMPLE_LIST_FILE="${WORKDIR}/sample_list.txt"
+
+# Get list of samples from fastq directory
+cd "$FASTQ_DIR" || error_exit "Cannot access FastQ directory"
+ls -d */ 2>/dev/null | sed 's|/$||' > "$SAMPLE_LIST_FILE" || error_exit "Failed to list samples"
+
+if [ ! -s "$SAMPLE_LIST_FILE" ]; then
+    error_exit "No samples found in $FASTQ_DIR"
+fi
+
+SAMPLE_COUNT=$(wc -l < "$SAMPLE_LIST_FILE")
+echo "Found $SAMPLE_COUNT samples"
+echo ""
+
+# ============================================================================
+# Process Each Sample
+# ============================================================================
+
+cd "$WORKDIR" || error_exit "Cannot access working directory"
+
+# Increase file descriptor limit for STAR
+ulimit -n 4096
+
+while IFS= read -r sample; do
+    if [ -z "$sample" ]; then
+        continue
+    fi
+    
+    echo "----------------------------------------"
+    echo "Processing sample: $sample"
+    echo "----------------------------------------"
+    
+    # Define file paths for this sample
+    R1_INPUT="${FASTQ_DIR}${sample}/${sample}_R1.fq.gz"
+    R2_INPUT="${FASTQ_DIR}${sample}/${sample}_R2.fq.gz"
+    R1_OUTPUT="${TRIM_DIR}${sample}/${sample}_R1_paired.fq.gz"
+    R2_OUTPUT="${TRIM_DIR}${sample}/${sample}_R2_paired.fq.gz"
+    
+    SAMPLE_TRIM_DIR="${TRIM_DIR}${sample}/"
+    SAMPLE_HG38_DIR="${HG38_DIR}${sample}/"
+    
+    # ========================================================================
+    # Step 1: Quality Control and Adapter Trimming
+    # ========================================================================
+    echo "[Step 1/3] Quality control and adapter trimming..."
+    
+    mkdir -p "$SAMPLE_TRIM_DIR" || error_exit "Failed to create trim directory"
+    
+    if [ ! -f "$R1_INPUT" ] || [ ! -f "$R2_INPUT" ]; then
+        echo "WARNING: Input files not found for $sample, skipping..."
+        continue
+    fi
+    
+    fastp \
+        -i "$R1_INPUT" \
+        -I "$R2_INPUT" \
+        -o "$R1_OUTPUT" \
+        -O "$R2_OUTPUT" \
+        --adapter_sequence=GATCGGAAGAGCACACGTCTGAACTCCAGTCAC \
+        --adapter_sequence_r2=AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGTA \
+        -g 30 \
+        -3 \
+        -l 50 \
+        --json "${SAMPLE_TRIM_DIR}${sample}_fastp.json" \
+        --html "${SAMPLE_TRIM_DIR}${sample}_fastp.html" \
+        || error_exit "fastp failed for $sample"
+    
+    # ========================================================================
+    # Step 2: STAR Alignment
+    # ========================================================================
+    echo "[Step 2/3] Aligning to reference genome using STAR..."
+    
+    mkdir -p "$SAMPLE_HG38_DIR" || error_exit "Failed to create alignment directory"
+    
+    cd "$SAMPLE_HG38_DIR" || error_exit "Cannot access sample directory"
+    
+    STAR \
+        --runThreadN "$THREADS" \
+        --genomeDir "$STAR_INDEX" \
+        --readFilesCommand gunzip -c \
+        --readFilesIn "$R1_OUTPUT" "$R2_OUTPUT" \
+        --outSAMtype BAM SortedByCoordinate \
+        --outFileNamePrefix "${SAMPLE_HG38_DIR}/" \
+        --outBAMsortingThreadN "$THREADS" \
+        --bamRemoveDuplicatesType UniqueIdenticalNotMulti \
+        --quantMode TranscriptomeSAM GeneCounts \
+        --outSAMstrandField intronMotif \
+        --outFilterIntronMotifs RemoveNoncanonical \
+        || error_exit "STAR alignment failed for $sample"
+    
+    # ========================================================================
+    # Step 3: RSEM Expression Quantification
+    # ========================================================================
+    echo "[Step 3/3] Calculating expression using RSEM..."
+    
+    TRANSCRIPTOME_BAM="${SAMPLE_HG38_DIR}Aligned.toTranscriptome.out.bam"
+    
+    if [ ! -f "$TRANSCRIPTOME_BAM" ]; then
+        error_exit "Transcriptome BAM file not found: $TRANSCRIPTOME_BAM"
+    fi
+    
+    rsem-calculate-expression \
+        --no-bam-output \
+        --paired-end \
+        --alignments \
+        -p "$THREADS" \
+        "$TRANSCRIPTOME_BAM" \
+        "$RSEM_INDEX" \
+        "${SAMPLE_HG38_DIR}${sample}" \
+        || error_exit "RSEM quantification failed for $sample"
+    
+    # Copy results to work directory
+    cp "${SAMPLE_HG38_DIR}${sample}.isoforms.results.txt" "${WORKDIR}${sample}.isoforms.results" \
+        || error_exit "Failed to copy isoforms results"
+    
+    cp "${SAMPLE_HG38_DIR}${sample}.genes.results.txt" "${WORKDIR}${sample}.genes.results" \
+        || error_exit "Failed to copy genes results"
+    
+    cd "$WORKDIR" || error_exit "Cannot return to working directory"
+    echo ""
+    
+done < "$SAMPLE_LIST_FILE"
+
+# ============================================================================
+# Generate Expression Matrices
+# ============================================================================
+
+echo "=========================================="
+echo "Generating expression matrices"
+echo "=========================================="
+
+cd "$WORKDIR" || error_exit "Cannot access working directory"
+
+# Generate isoforms matrix
+if ls *.isoforms.results 1> /dev/null 2>&1; then
+    rsem-generate-data-matrix *.isoforms.results > isoforms.results.matrix \
+        || error_exit "Failed to generate isoforms matrix"
+    echo "Isoforms matrix generated: isoforms.results.matrix"
+else
+    echo "WARNING: No isoforms results files found"
+fi
+
+# Generate genes matrix
+if ls *.genes.results 1> /dev/null 2>&1; then
+    rsem-generate-data-matrix *.genes.results > genes.results.matrix \
+        || error_exit "Failed to generate genes matrix"
+    echo "Genes matrix generated: genes.results.matrix"
+else
+    echo "WARNING: No genes results files found"
+fi
+
+# Clean up intermediate files
+rm -f *.isoforms.results *.genes.results
+
+# ============================================================================
+# Combine Replicates (if group file provided)
+# ============================================================================
+
+if [ -n "$GROUP_FILE" ] && [ -f "$GROUP_FILE" ]; then
+    echo ""
+    echo "Combining replicates according to group file..."
+    
+    while IFS= read -r line; do
+        if [ -z "$line" ]; then
+            continue
+        fi
+        
+        arr=($line)
+        sample="${arr[0]}"
+        
+        # Extract TPM column (column 6) from each replicate
+        for i in 1 2 3; do
+            replicate_file="${sample}.${i}.genes.results"
+            if [ -f "$replicate_file" ]; then
+                cut -f6 "$replicate_file" > "${sample}.${i}.genes.txt"
+            else
+                echo "WARNING: Replicate file not found: $replicate_file"
+            fi
+        done
+        
+        # Combine replicates
+        if [ -f "${sample}.1.genes.txt" ] && [ -f "${sample}.2.genes.txt" ] && [ -f "${sample}.3.genes.txt" ]; then
+            paste "${sample}.1.genes.txt" "${sample}.2.genes.txt" "${sample}.3.genes.txt" \
+                > "${sample}_combine_genes.txt"
+        fi
+    done < "$GROUP_FILE"
+    
+    # Clean up intermediate files
+    rm -f *.genes.txt
+    
+    echo "Replicate combination completed"
+fi
+
+# ============================================================================
+# Generate TPM Expression Matrix (Alternative Method)
+# ============================================================================
+
+echo ""
+echo "Generating TPM expression matrix..."
+
+while IFS= read -r sample; do
+    if [ -z "$sample" ]; then
+        continue
+    fi
+    
+    genes_results="${HG38_DIR}${sample}/${sample}.genes.results.txt"
+    
+    if [ -f "$genes_results" ]; then
+        # Extract TPM column (column 6) and add sample name as header
+        awk -v s="$sample" 'NR==1 {print "gene_id\t" s "_TPM"; next} {print $1 "\t" $6}' \
+            "$genes_results" > "${WORKDIR}${sample}.genes.tpm.txt" \
+            || echo "WARNING: Failed to process $sample"
+    fi
+done < "$SAMPLE_LIST_FILE"
+
+echo ""
+echo "=========================================="
+echo "Pipeline completed successfully!"
+echo "=========================================="
+echo ""
+echo "Output files:"
+echo "  - isoforms.results.matrix"
+echo "  - genes.results.matrix"
+echo "  - *.genes.tpm.txt (individual TPM files)"
+if [ -n "$GROUP_FILE" ]; then
+    echo "  - *_combine_genes.txt (combined replicates)"
+fi
+echo ""
